@@ -1,4 +1,4 @@
-module github.com/raulk/go-bs-lmdb
+module github.com/filecoin-project/go-bs-lmdb
 
 go 1.15
 
