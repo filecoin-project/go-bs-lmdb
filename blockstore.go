@@ -152,8 +152,8 @@ func (b *Blockstore) GetSize(cid cid.Cid) (int, error) {
 func (b *Blockstore) Put(block blocks.Block) error {
 	return b.env.Update(func(txn *lmdb.Txn) error {
 		err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
-		if err != nil && !lmdb.IsErrno(err, lmdb.KeyExist) {
-			return err
+		if err == nil || lmdb.IsErrno(err, lmdb.KeyExist) {
+			return nil
 		}
 		return err
 	})
@@ -164,6 +164,7 @@ func (b *Blockstore) PutMany(blocks []blocks.Block) error {
 		for _, block := range blocks {
 			err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
 			if err != nil && !lmdb.IsErrno(err, lmdb.KeyExist) {
+				txn.Abort() // short-circuit
 				return err
 			}
 		}
