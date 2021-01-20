@@ -94,7 +94,7 @@ func TestMmapExpansionSucceedsReopen(t *testing.T) {
 	info, err = bs.(*Blockstore).env.Info()
 	require.NoError(t, err)
 	reopened := info.MapSize
-	require.EqualValues(t, 34185216, reopened) // this is the exact database size.
+	require.EqualValues(t, 34168832, reopened) // this is the exact database size.
 
 	// verify that we can add more entries, and that we grow again.
 	putEntries(t, bs, 16*1024, 1*1024)

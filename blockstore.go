@@ -18,14 +18,14 @@ import (
 
 var (
 	// DefaultInitialMmapSize is the default initial mmap size to be used if the
-	// supplied value is zero or invalid. Unless modified, this value is 16MiB.
-	DefaultInitialMmapSize = int64(16 << 20) // 16MiB.
+	// supplied value is zero or invalid. Unless modified, this value is 1GiB.
+	DefaultInitialMmapSize = int64(1 << 30) // 1GiB.
 
 	// DefaultMmapGrowthStepFactor is the default mmap growth step factor to be
 	// used if the supplied value is zero or invalid. Unless modified, this
-	// value is 2, which doubles the mmap every time we encounter an
-	// MDB_MAP_FULL error.
-	DefaultMmapGrowthStepFactor = float64(2) // double the mmap size every time.
+	// value is 1.5, which multiplies the mmap size by 1.5 every time we
+	// encounter an MDB_MAP_FULL error.
+	DefaultMmapGrowthStepFactor = 1.5 // 1.5x the mmap every time.
 
 	// DefaultMmapGrowthStepMax is the default mmap growth maximum step to be
 	// used if the supplied value is zero or invalid. Unless modified, this
@@ -121,7 +121,7 @@ func Open(opts *Options) (*Blockstore, error) {
 	//
 	// InitialMmapSize cannot be negative nor zero, and must be rounded up to a multiple of the OS page size.
 	if v := opts.InitialMmapSize; v <= 0 {
-		log.Warnf("initial mmap size (%d) cannot be negative or zero; falling back to default: %d", v, DefaultInitialMmapSize)
+		log.Debugf("using default initial mmap size: %d", DefaultInitialMmapSize)
 		opts.InitialMmapSize = DefaultInitialMmapSize
 	}
 	if v := roundup(opts.InitialMmapSize, int64(pagesize)); v != opts.InitialMmapSize {
@@ -131,7 +131,7 @@ func Open(opts *Options) (*Blockstore, error) {
 
 	// MmapGrowthStepMax cannot be negative nor zero, and must be rounded up to a multiple of the OS page size.
 	if v := opts.MmapGrowthStepMax; v <= 0 {
-		log.Warnf("maximum mmap growth step (%d) cannot be negative or zero; falling back to default: %d", v, DefaultMmapGrowthStepMax)
+		log.Debugf("using default max mmap growth step: %d", DefaultMmapGrowthStepMax)
 		opts.MmapGrowthStepMax = DefaultMmapGrowthStepMax
 	}
 	if v := roundup(opts.MmapGrowthStepMax, int64(pagesize)); v != opts.MmapGrowthStepMax {
@@ -140,7 +140,7 @@ func Open(opts *Options) (*Blockstore, error) {
 	}
 
 	if v := opts.MmapGrowthStepFactor; v <= 1 {
-		log.Warnf("mmap growth step factor (%f) cannot be lower or equal to 1; falling back to default: %f", v, DefaultMmapGrowthStepFactor)
+		log.Debugf("using default mmap growth step factor: %f", DefaultMmapGrowthStepFactor)
 		opts.MmapGrowthStepFactor = DefaultMmapGrowthStepFactor
 	}
 
