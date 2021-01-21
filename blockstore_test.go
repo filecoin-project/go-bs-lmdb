@@ -9,9 +9,11 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	logger "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multihash"
 	bstest "github.com/raulk/go-bs-tests"
@@ -220,6 +222,31 @@ func TestGrowUnderConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestRetryWhenReadersFull(t *testing.T) {
+	opts := Options{
+		MaxReaders: 1, // single reader to induce contention.
+	}
+
+	bs, _ := newBlockstore(opts)(t)
+	defer bs.(io.Closer).Close()
+
+	putEntries(t, bs, 1*1024, 1*1024)
+
+	// this context cancels in 2 seconds.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ch, err := bs.AllKeysChan(ctx)
+	require.NoError(t, err)
+	<-ch // consume one element, then leave it hanging.
+
+	// this get will block until the cursor has finished.
+	start := time.Now()
+	_, err = bs.Get(randomCID())
+	require.Equal(t, blockstore.ErrNotFound, err)
+	require.GreaterOrEqual(t, time.Since(start).Nanoseconds(), 1*time.Second.Nanoseconds())
 }
 
 func putEntries(t *testing.T, bs bstest.Blockstore, count int, size int) {
