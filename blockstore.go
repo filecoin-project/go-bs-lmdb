@@ -335,9 +335,7 @@ Retry:
 		err = blockstore.ErrNotFound
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		d := b.jitteredDelay()
-		log.Warnf("get encountered MDB_READERS_FULL; waiting %s", d)
-		time.Sleep(d)
+		b.sleep("get")
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -364,9 +362,7 @@ Retry:
 		err = blockstore.ErrNotFound
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		d := b.jitteredDelay()
-		log.Warnf("view encountered MDB_READERS_FULL; waiting %s", d)
-		time.Sleep(d)
+		b.sleep("view")
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -394,9 +390,7 @@ Retry:
 		err = blockstore.ErrNotFound
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		d := b.jitteredDelay()
-		log.Warnf("get size encountered MDB_READERS_FULL; waiting %s", d)
-		time.Sleep(d)
+		b.sleep("get size")
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -431,9 +425,7 @@ Retry:
 		goto Retry
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		d := b.jitteredDelay()
-		log.Warnf("put encountered MDB_READERS_FULL; waiting %s", d)
-		time.Sleep(d)
+		b.sleep("put")
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -471,9 +463,7 @@ Retry:
 		goto Retry
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		d := b.jitteredDelay()
-		log.Warnf("put many encountered MDB_READERS_FULL; waiting %s", d)
-		time.Sleep(d)
+		b.sleep("put many")
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -504,9 +494,7 @@ Retry:
 		goto Retry
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		d := b.jitteredDelay()
-		log.Warnf("delete encountered MDB_READERS_FULL; waiting %s", d)
-		time.Sleep(d)
+		b.sleep("delete")
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -696,16 +684,18 @@ func (b *Blockstore) grow() error {
 	return nil
 }
 
-func roundup(value, multiple int64) int64 {
-	return int64(math.Ceil(float64(value)/float64(multiple))) * multiple
-}
-
-func (b *Blockstore) jitteredDelay() time.Duration {
+func (b *Blockstore) sleep(opname string) {
 	r := rand.Int63n(int64(b.retryJitterBound))
 	// we don't need this to be perfect, we need it to be performant,
 	// so we add when even, remove when odd.
 	if r%2 == 1 {
 		r = -r
 	}
-	return b.retryDelay + time.Duration(r)
+	d := b.retryDelay + time.Duration(r)
+	log.Warnf(opname+" encountered MDB_READERS_FULL; waiting %s", d)
+	time.Sleep(d)
+}
+
+func roundup(value, multiple int64) int64 {
+	return int64(math.Ceil(float64(value)/float64(multiple))) * multiple
 }
