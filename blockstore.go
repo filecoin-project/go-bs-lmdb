@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,9 @@ var (
 	// DefaultRetryDelay is the default retry delay for reattempting transactions
 	// that errored with MDB_READERS_FULL.
 	DefaultRetryDelay = 10 * time.Millisecond
+
+	// RetryJitter is the jitter to apply to the delay interval. Default: 20%.
+	RetryJitter = 0.2
 )
 
 var log = logging.Logger("lmdbbs")
@@ -71,9 +75,10 @@ type Blockstore struct {
 	// opts are the options for this blockstore.
 	opts *Options
 
-	retryDelay time.Duration
-	pagesize   int64 // the memory page size reported by the OS.
-	closed     int32
+	retryDelay       time.Duration
+	retryJitterBound time.Duration
+	pagesize         int64 // the memory page size reported by the OS.
+	closed           int32
 }
 
 var (
@@ -116,6 +121,7 @@ type Options struct {
 	// with MDB_READERS_FULL will be reattempted. Contention due to incorrect
 	// sizing of MaxReaders will thus lead to a system slowdown via
 	// backpressure, instead of a straight out error.
+	// Jittered by RetryJitter (default: +/-20%).
 	RetryDelay time.Duration
 }
 
@@ -262,11 +268,12 @@ func Open(opts *Options) (*Blockstore, error) {
 	}
 
 	bs := &Blockstore{
-		env:        env,
-		opts:       opts,
-		dedupGrow:  new(sync.Once),
-		pagesize:   int64(pagesize),
-		retryDelay: opts.RetryDelay,
+		env:              env,
+		opts:             opts,
+		dedupGrow:        new(sync.Once),
+		pagesize:         int64(pagesize),
+		retryDelay:       opts.RetryDelay,
+		retryJitterBound: time.Duration(float64(opts.RetryDelay) * RetryJitter),
 	}
 	err = env.Update(func(txn *lmdb.Txn) (err error) {
 		bs.db, err = txn.OpenRoot(lmdb.Create)
@@ -328,8 +335,9 @@ Retry:
 		err = blockstore.ErrNotFound
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		log.Warnf("get encountered MDB_READERS_FULL; waiting %s", b.retryDelay)
-		time.Sleep(b.retryDelay)
+		d := b.jitteredDelay()
+		log.Warnf("get encountered MDB_READERS_FULL; waiting %s", d)
+		time.Sleep(d)
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -356,8 +364,9 @@ Retry:
 		err = blockstore.ErrNotFound
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		log.Warnf("view encountered MDB_READERS_FULL; waiting %s", b.retryDelay)
-		time.Sleep(b.retryDelay)
+		d := b.jitteredDelay()
+		log.Warnf("view encountered MDB_READERS_FULL; waiting %s", d)
+		time.Sleep(d)
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -385,8 +394,9 @@ Retry:
 		err = blockstore.ErrNotFound
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		log.Warnf("get size encountered MDB_READERS_FULL; waiting %s", b.retryDelay)
-		time.Sleep(b.retryDelay)
+		d := b.jitteredDelay()
+		log.Warnf("get size encountered MDB_READERS_FULL; waiting %s", d)
+		time.Sleep(d)
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -421,8 +431,9 @@ Retry:
 		goto Retry
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		log.Warnf("put encountered MDB_READERS_FULL; waiting %s", b.retryDelay)
-		time.Sleep(b.retryDelay)
+		d := b.jitteredDelay()
+		log.Warnf("put encountered MDB_READERS_FULL; waiting %s", d)
+		time.Sleep(d)
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -460,8 +471,9 @@ Retry:
 		goto Retry
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		log.Warnf("put many encountered MDB_READERS_FULL; waiting %s", b.retryDelay)
-		time.Sleep(b.retryDelay)
+		d := b.jitteredDelay()
+		log.Warnf("put many encountered MDB_READERS_FULL; waiting %s", d)
+		time.Sleep(d)
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -492,8 +504,9 @@ Retry:
 		goto Retry
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		log.Warnf("delete encountered MDB_READERS_FULL; waiting %s", b.retryDelay)
-		time.Sleep(b.retryDelay)
+		d := b.jitteredDelay()
+		log.Warnf("delete encountered MDB_READERS_FULL; waiting %s", d)
+		time.Sleep(d)
 		b.oplock.RLock()
 		goto Retry
 	}
@@ -685,4 +698,14 @@ func (b *Blockstore) grow() error {
 
 func roundup(value, multiple int64) int64 {
 	return int64(math.Ceil(float64(value)/float64(multiple))) * multiple
+}
+
+func (b *Blockstore) jitteredDelay() time.Duration {
+	r := rand.Int63n(int64(b.retryJitterBound))
+	// we don't need this to be perfect, we need it to be performant,
+	// so we add when even, remove when odd.
+	if r%2 == 1 {
+		r = -r
+	}
+	return b.retryDelay + time.Duration(r)
 }
