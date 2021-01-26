@@ -249,6 +249,30 @@ func TestRetryWhenReadersFull(t *testing.T) {
 	require.GreaterOrEqual(t, time.Since(start).Nanoseconds(), 1*time.Second.Nanoseconds())
 }
 
+// TestMmapExpansionPutMany tests that a PutMany operation yields when it
+// encounters a MDB_MAP_FULL error, and that it retries once the grow finishes.
+func TestMmapExpansionPutMany(t *testing.T) {
+	opts := Options{
+		InitialMmapSize:      1 << 10,
+		MmapGrowthStepFactor: 1.5,
+		MmapGrowthStepMax:    2 << 10,
+	}
+
+	bs, _ := newBlockstore(opts)(t)
+	defer bs.(io.Closer).Close()
+
+	var blks []blocks.Block
+	for i := 0; i < 1024; i++ {
+		b := make([]byte, 1024)
+		rand.Read(b)
+		blk := blocks.NewBlock(b)
+		blks = append(blks, blk)
+	}
+
+	err := bs.PutMany(blks)
+	require.NoError(t, err)
+}
+
 func putEntries(t *testing.T, bs bstest.Blockstore, count int, size int) {
 	for i := 0; i < count; i++ {
 		b := make([]byte, size)
