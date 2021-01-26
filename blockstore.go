@@ -404,22 +404,19 @@ func (b *Blockstore) Put(block blocks.Block) error {
 
 Retry:
 	err := b.env.Update(func(txn *lmdb.Txn) error {
-		err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
-		if err == nil || lmdb.IsErrno(err, lmdb.KeyExist) {
-			return nil
-		}
-		return err
+		return txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
 	})
 
 	switch {
-	case err == nil: // shortcircuit happy path.
+	case err == nil || lmdb.IsErrno(err, lmdb.KeyExist): // shortcircuit happy path.
+		return nil
 	case lmdb.IsMapFull(err):
 		o := b.dedupGrow   // take the deduplicator under the lock.
 		b.oplock.RUnlock() // drop the concurrent lock.
 		var err error
 		o.Do(func() { err = b.grow() })
 		if err != nil {
-			return fmt.Errorf("lmbd put failed: %w", err)
+			return fmt.Errorf("lmdb put failed: %w", err)
 		}
 		b.oplock.RLock() // reclaim the concurrent lock.
 		goto Retry
@@ -442,8 +439,7 @@ Retry:
 		for _, block := range blocks {
 			err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
 			if err != nil && !lmdb.IsErrno(err, lmdb.KeyExist) {
-				txn.Abort() // short-circuit
-				return err
+				return err // short-circuit
 			}
 		}
 		return nil
@@ -457,7 +453,7 @@ Retry:
 		var err error
 		o.Do(func() { err = b.grow() })
 		if err != nil {
-			return fmt.Errorf("lmbd put many failed: %w", err)
+			return fmt.Errorf("lmdb put many failed: %w", err)
 		}
 		b.oplock.RLock() // reclaim the concurrent lock.
 		goto Retry
@@ -488,7 +484,7 @@ Retry:
 		var err error
 		o.Do(func() { err = b.grow() })
 		if err != nil {
-			return fmt.Errorf("lmbd delete failed: %w", err)
+			return fmt.Errorf("lmdb delete failed: %w", err)
 		}
 		b.oplock.RLock() // reclaim the concurrent lock.
 		goto Retry
