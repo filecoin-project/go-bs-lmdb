@@ -298,6 +298,7 @@ func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
+Retry:
 	err := b.env.View(func(txn *lmdb.Txn) error {
 		txn.RawRead = true
 		_, err := txn.Get(b.db, cid.Hash())
@@ -308,6 +309,12 @@ func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
 		return true, nil
 	case lmdb.IsNotFound(err):
 		return false, nil
+	case lmdb.IsErrno(err, lmdb.ReadersFull):
+		b.oplock.RUnlock() // yield.
+		b.sleep("has")
+		b.oplock.RLock()
+		goto Retry
+
 	}
 	return false, err
 }
