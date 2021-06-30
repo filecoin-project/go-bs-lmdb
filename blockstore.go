@@ -702,3 +702,7 @@ func (b *Blockstore) sleep(opname string) {
 func roundup(value, multiple int64) int64 {
 	return int64(math.Ceil(float64(value)/float64(multiple))) * multiple
 }
+
+func (b *Blockstore) Stat() (*lmdb.Stat, error) {
+	return b.env.Stat()
+}
