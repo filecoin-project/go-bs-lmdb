@@ -504,6 +504,42 @@ Retry:
 	return err
 }
 
+func (b *Blockstore) DeleteMany(cids []cid.Cid) error {
+	b.oplock.RLock()
+	defer b.oplock.RUnlock()
+
+Retry:
+	err := b.env.Update(func(txn *lmdb.Txn) error {
+		for _, c := range cids {
+			if err := txn.Del(b.db, c.Hash(), nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	switch {
+	case err == nil || lmdb.IsNotFound(err): // shortcircuit happy path.
+		return nil
+	case lmdb.IsMapFull(err):
+		o := b.dedupGrow   // take the deduplicator under the lock.
+		b.oplock.RUnlock() // drop the concurrent lock.
+		var err error
+		o.Do(func() { err = b.grow() })
+		if err != nil {
+			return fmt.Errorf("lmdb delete failed: %w", err)
+		}
+		b.oplock.RLock() // reclaim the concurrent lock.
+		goto Retry
+	case lmdb.IsErrno(err, lmdb.ReadersFull):
+		b.oplock.RUnlock() // yield.
+		b.sleep("delete many")
+		b.oplock.RLock()
+		goto Retry
+	}
+	return err
+
+}
+
 type cursor struct {
 	ctx context.Context
 	b   *Blockstore

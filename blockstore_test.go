@@ -292,3 +292,55 @@ func randomCID() cid.Cid {
 	mh, _ := multihash.Encode(b, multihash.SHA2_256)
 	return cid.NewCidV1(cid.Raw, mh)
 }
+
+type deleteManyer interface {
+	DeleteMany([]cid.Cid) error
+}
+
+func TestDeleteMany(t *testing.T) {
+	opts := Options{
+		InitialMmapSize:      1 << 10,
+		MmapGrowthStepFactor: 1.5,
+		MmapGrowthStepMax:    2 << 10,
+	}
+
+	bs, _ := newBlockstore(opts)(t)
+	defer bs.(io.Closer).Close()
+
+	var cids []cid.Cid
+	b := make([]byte, 1024)
+	for i := 0; i < 500; i++ {
+		rand.Read(b)
+		blk := blocks.NewBlock(b)
+		err := bs.Put(blk)
+		if err != nil {
+			fmt.Println(err)
+		}
+		require.NoError(t, err)
+		cids = append(cids, blk.Cid())
+	}
+
+	todelete := cids[:100]
+
+	dm := bs.(deleteManyer)
+
+	if err := dm.DeleteMany(todelete); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted := make(map[cid.Cid]bool)
+	for _, d := range todelete {
+		deleted[d] = true
+	}
+
+	ch, err := bs.AllKeysChan(context.TODO())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for c := range ch {
+		if deleted[c] {
+			t.Fatal("found cid in blockstore we deleted")
+		}
+	}
+}
