@@ -510,8 +510,8 @@ func (b *Blockstore) DeleteMany(cids []cid.Cid) error {
 
 Retry:
 	err := b.env.Update(func(txn *lmdb.Txn) error {
-		for _, cid := range cids {
-			if err := txn.Del(b.db, cid.Hash(), nil); err != nil {
+		for _, c := range cids {
+			if err := txn.Del(b.db, c.Hash(), nil); err != nil {
 				return err
 			}
 		}
@@ -532,7 +532,7 @@ Retry:
 		goto Retry
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
-		b.sleep("delete")
+		b.sleep("delete many")
 		b.oplock.RLock()
 		goto Retry
 	}
