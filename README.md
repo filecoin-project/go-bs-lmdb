@@ -1,3 +1,5 @@
+!!! WARNING: This package is not stable and may cause random crashes or data corruption in your application if used.
+
 # go-bs-lmdb
 
 An LMDB-backed [IPFS Blockstore](https://github.com/ipfs/go-ipfs-blockstore/).
