@@ -273,35 +273,49 @@ func (b *Blockstore) getImpl(cid cid.Cid, handler func(val []byte) error) error 
 			}
 			return err
 		})
-		if lmdb.IsErrno(err, lmdb.ReadersFull) {
+		switch {
+		case lmdb.IsErrno(err, lmdb.ReadersFull):
 			b.oplock.RUnlock() // yield.
 			b.sleep("getImpl")
 			b.oplock.RLock()
-		} else {
+		case lmdb.IsMapResized(err):
+			if err = b.growGuarded(); err != nil {
+				return err
+			}
+		default:
 			return err
 		}
 	}
 }
 
+func wrapGrowError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("lmdb grow failed: %w", err)
+}
+
+func (b *Blockstore) growGuarded() error {
+	o := b.dedupGrow       // take the deduplicator under the lock.
+	b.oplock.RUnlock()     // drop the concurrent lock.
+	defer b.oplock.RLock() // reclaim the concurrent lock.
+	var err error
+	o.Do(func() { err = b.grow() })
+	return wrapGrowError(err)
+}
+
 func (b *Blockstore) updateImpl(doUpdate func(txn *lmdb.Txn) error) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
-
 	for {
 		err := b.env.Update(doUpdate)
-
 		switch {
 		case err == nil: // shortcircuit happy path.
 			return nil
-		case lmdb.IsMapFull(err):
-			o := b.dedupGrow   // take the deduplicator under the lock.
-			b.oplock.RUnlock() // drop the concurrent lock.
-			var err error
-			o.Do(func() { err = b.grow() })
-			if err != nil {
-				return fmt.Errorf("lmdb update impl failed: %w", err)
+		case lmdb.IsMapFull(err) || lmdb.IsMapResized(err):
+			if err = b.growGuarded(); err != nil {
+				return err
 			}
-			b.oplock.RLock() // reclaim the concurrent lock.
 		case lmdb.IsErrno(err, lmdb.ReadersFull):
 			b.oplock.RUnlock() // yield.
 			b.sleep("updateImpl")
