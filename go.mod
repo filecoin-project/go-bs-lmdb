@@ -8,6 +8,7 @@ require (
 	github.com/ipfs/go-cid v0.0.7
 	github.com/ipfs/go-datastore v0.4.5 // indirect
 	github.com/ipfs/go-ipfs-blockstore v1.0.3
+	github.com/ipfs/go-ipfs-util v0.0.2
 	github.com/ipfs/go-log v1.0.4 // indirect
 	github.com/ipfs/go-log/v2 v2.1.2-0.20200626104915-0016c0b4b3e4
 	github.com/ledgerwatch/lmdb-go v1.18.2
@@ -16,9 +17,10 @@ require (
 	github.com/multiformats/go-multihash v0.0.14
 	github.com/multiformats/go-varint v0.0.6 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
-	github.com/pkg/errors v0.9.1
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/raulk/go-bs-tests v0.0.4
 	github.com/stretchr/testify v1.6.1
+	go.uber.org/atomic v1.6.0
 	go.uber.org/zap v1.16.0 // indirect
 	golang.org/x/crypto v0.0.0-20200820211705-5c72a883971a // indirect
 	golang.org/x/lint v0.0.0-20200130185559-910be7a94367 // indirect

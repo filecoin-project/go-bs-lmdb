@@ -15,7 +15,7 @@ import (
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ledgerwatch/lmdb-go/lmdb"
-	"github.com/pkg/errors"
+	uatomic "go.uber.org/atomic"
 )
 
 var (
@@ -52,15 +52,19 @@ var (
 
 var log = logging.Logger("lmdbbs")
 
+// Blockstore is a wrapper around lmdb database and environment,
+// containing some additional parameters to execute growing of
+// mmaped section.
 type Blockstore struct {
 	// oplock is a two-tier concurrent/exclusive lock to synchronize mmap
 	// growth operations. The concurrent tier is used by blockstore operations,
 	// and the exclusive lock is acquired by the mmap grow operation.
 	oplock sync.RWMutex
 
-	// cursors.
+	// mutex guarding all operations with cursor list
 	cursorlock sync.Mutex
-	cursors    []*cursor
+	// list of all active cursors
+	cursors []*cursor
 
 	// dedupGrow deduplicates concurrent calls to grow(); it is recycled every
 	// time that grow() actually runs.
@@ -79,6 +83,13 @@ type Blockstore struct {
 	retryJitterBound time.Duration
 	pagesize         int64 // the memory page size reported by the OS.
 	closed           int32
+	rehash           *uatomic.Bool
+}
+
+// HashOnRead sets a variable which controls whether
+// cid is checked to match the hash of the block
+func (b *Blockstore) HashOnRead(enabled bool) {
+	b.rehash.Store(enabled)
 }
 
 var (
@@ -86,6 +97,7 @@ var (
 	_ blockstore.Viewer     = (*Blockstore)(nil)
 )
 
+// Options for the Blockstore
 type Options struct {
 	// Path is the directory where the LMDB blockstore resides. If it doesn't
 	// exist, it will be created.
@@ -123,8 +135,15 @@ type Options struct {
 	// backpressure, instead of a straight out error.
 	// Jittered by RetryJitter (default: +/-20%).
 	RetryDelay time.Duration
+
+	// NoLock: Don't do any locking. If concurrent access is anticipated, the caller must manage all concurrency
+	//   itself. For proper operation the caller must enforce single-writer semantics, and must ensure that no readers
+	//   are using old transactions while a writer is active. The simplest approach is to use an exclusive lock so that
+	//   no readers may be active at all when a writer begins.
+	NoLock bool
 }
 
+// Open initiates lmdb environment, database and returns Blockstore
 func Open(opts *Options) (*Blockstore, error) {
 	path := opts.Path
 	switch st, err := os.Stat(path); {
@@ -192,70 +211,15 @@ func Open(opts *Options) (*Blockstore, error) {
 		opts.RetryDelay = DefaultRetryDelay
 	}
 
-	// Environment options:
-	// --------------------
-	//
-	// - MDB_FIXEDMAP: Use a fixed address for the mmap region. This flag must be specified when creating the environment,
-	//   and is stored persistently in the environment. If successful, the memory map will always reside at the same
-	//   virtual address and pointers used to reference data items in the database will be constant across multiple
-	//   invocations. This option may not always work, depending on how the operating system has allocated memory to
-	//   shared libraries and other uses. The feature is highly experimental.
-	// - MDB_NOSUBDIR: By default, LMDB creates its environment in a directory whose pathname is given in path, and
-	//   creates its data and lock files under that directory. With this option, path is used as-is for the database
-	//   main data file. The database lock file is the path with "-lock" appended.
-	// - MDB_RDONLY: Open the environment in read-only mode. No write operations will be allowed. LMDB will still
-	//   modify the lock file - except on read-only filesystems, where LMDB does not use locks.
-	// - MDB_WRITEMAP: Use a writeable memory map unless MDB_RDONLY is set. This is faster and uses fewer mallocs,
-	//   but loses protection from application bugs like wild pointer writes and other bad updates into the database.
-	//   Incompatible with nested transactions. Do not mix processes with and without MDB_WRITEMAP on the same
-	//   environment. This can defeat durability (mdb_env_sync etc).
-	// - MDB_NOMETASYNC: Flush system buffers to disk only once per transaction, omit the metadata flush. Defer that
-	//   until the system flushes files to disk, or next non-MDB_RDONLY commit or mdb_env_sync(). This optimization
-	//   maintains database integrity, but a system crash may undo the last committed transaction. I.e. it preserves
-	//   the ACI (atomicity, consistency, isolation) but not D (durability) database property. This flag may be changed
-	//   at any time using mdb_env_set_flags().
-	// - MDB_NOSYNC: Don't flush system buffers to disk when committing a transaction. This optimization means a system
-	//   crash can corrupt the database or lose the last transactions if buffers are not yet flushed to disk. The risk
-	//   is governed by how often the system flushes dirty buffers to disk and how often mdb_env_sync() is called.
-	//   However, if the filesystem preserves write order and the MDB_WRITEMAP flag is not used, transactions exhibit
-	//   ACI (atomicity, consistency, isolation) properties and only lose D (durability). i.e. database integrity is
-	//   maintained, but a system crash may undo the final transactions. Note that (MDB_NOSYNC | MDB_WRITEMAP) leaves
-	//   the system with no hint for when to write transactions to disk, unless mdb_env_sync() is called.
-	//   (MDB_MAPASYNC | MDB_WRITEMAP) may be preferable. This flag may be changed at any time using
-	//   mdb_env_set_flags().
-	// - MDB_MAPASYNC: When using MDB_WRITEMAP, use asynchronous flushes to disk. As with MDB_NOSYNC, a system crash
-	//   can then corrupt the database or lose the last transactions. Calling mdb_env_sync() ensures on-disk database
-	//   integrity until next commit. This flag may be changed at any time using mdb_env_set_flags().
-	// - MDB_NOTLS: Don't use Thread-Local Storage. Tie reader locktable slots to MDB_txn objects instead of to threads.
-	//   i.e. mdb_txn_reset() keeps the slot reseved for the MDB_txn object. A thread may use parallel read-only
-	//   transactions. A read-only transaction may span threads if the user synchronizes its use. Applications that
-	//   multiplex many user threads over individual OS threads need this option. Such an application must also
-	//   serialize the write transactions in an OS thread, since LMDB's write locking is unaware of the user threads.
-	// - MDB_NOLOCK: Don't do any locking. If concurrent access is anticipated, the caller must manage all concurrency
-	//   itself. For proper operation the caller must enforce single-writer semantics, and must ensure that no readers
-	//   are using old transactions while a writer is active. The simplest approach is to use an exclusive lock so that
-	//   no readers may be active at all when a writer begins.
-	// - MDB_NORDAHEAD: Turn off readahead. Most operating systems perform readahead on read requests by default. This
-	//   option turns it off if the OS supports it. Turning it off may help random read performance when the DB is
-	//   larger than RAM and system RAM is full. The option is not implemented on Windows.
-	// - MDB_NOMEMINIT: Don't initialize malloc'd memory before writing to unused spaces in the data file. By default,
-	//   memory for pages written to the data file is obtained using malloc. While these pages may be reused in
-	//   subsequent transactions, freshly malloc'd pages will be initialized to zeroes before use. This avoids
-	//   persisting leftover data from other code (that used the heap and subsequently freed the memory) into the data
-	//   file. Note that many other system libraries may allocate and free memory from the heap for arbitrary uses.
-	//   e.g., stdio may use the heap for file I/O buffers. This initialization step has a modest performance cost so
-	//   some applications may want to disable it using this flag. This option can be a problem for applications which
-	//   handle sensitive data like passwords, and it makes memory checkers like Valgrind noisy. This flag is not needed
-	//   with MDB_WRITEMAP, which writes directly to the mmap instead of using malloc for pages. The initialization is
-	//   also skipped if MDB_RESERVE is used; the caller is expected to overwrite all of the memory that was reserved
-	//   in that case. This flag may be changed at any time using mdb_env_set_flags().
-	//
-	// Source: http://www.lmdb.tech/doc/group__mdb.html#ga32a193c6bf4d7d5c5d579e71f22e9340
+	// See ENV options: http://www.lmdb.tech/doc/group__mdb.html#ga32a193c6bf4d7d5c5d579e71f22e9340
 
 	// Maybe consider NoTLS tradeoffs.
 	// https://twitter.com/yrashk/status/838621043480748036
 	// https://github.com/PumpkinDB/PumpkinDB/pull/178
 	var flags uint = lmdb.NoReadahead | lmdb.WriteMap
+	if opts.NoLock {
+		flags |= lmdb.NoLock
+	}
 	if opts.ReadOnly {
 		flags |= lmdb.Readonly
 	}
@@ -274,8 +238,9 @@ func Open(opts *Options) (*Blockstore, error) {
 		pagesize:         int64(pagesize),
 		retryDelay:       opts.RetryDelay,
 		retryJitterBound: time.Duration(float64(opts.RetryDelay) * RetryJitter),
+		rehash:           uatomic.NewBool(false),
 	}
-	err = env.Update(func(txn *lmdb.Txn) (err error) {
+	err = env.View(func(txn *lmdb.Txn) (err error) {
 		bs.db, err = txn.OpenRoot(lmdb.Create)
 		return err
 	})
@@ -286,6 +251,7 @@ func Open(opts *Options) (*Blockstore, error) {
 	return bs, err
 }
 
+// Close closes the blockstore
 func (b *Blockstore) Close() error {
 	if !atomic.CompareAndSwapInt32(&b.closed, 0, 1) {
 		return nil
@@ -294,155 +260,158 @@ func (b *Blockstore) Close() error {
 	return b.env.Close()
 }
 
+func (b *Blockstore) getImpl(cid cid.Cid, handler func(val []byte) error) error {
+	b.oplock.RLock()
+	defer b.oplock.RUnlock()
+
+	for {
+		err := b.env.View(func(txn *lmdb.Txn) error {
+			txn.RawRead = true
+			v, err := txn.Get(b.db, cid.Hash())
+			if err == nil {
+				err = handler(v)
+			}
+			return err
+		})
+		switch {
+		case lmdb.IsErrno(err, lmdb.ReadersFull):
+			b.oplock.RUnlock() // yield.
+			b.sleep("getImpl")
+			b.oplock.RLock()
+		case lmdb.IsMapResized(err):
+			if err = b.growGuarded(); err != nil {
+				return err
+			}
+		default:
+			return err
+		}
+	}
+}
+
+func wrapGrowError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("lmdb grow failed: %w", err)
+}
+
+func (b *Blockstore) growGuarded() error {
+	o := b.dedupGrow       // take the deduplicator under the lock.
+	b.oplock.RUnlock()     // drop the concurrent lock.
+	defer b.oplock.RLock() // reclaim the concurrent lock.
+	var err error
+	o.Do(func() { err = b.grow() })
+	return wrapGrowError(err)
+}
+
+func (b *Blockstore) updateImpl(doUpdate func(txn *lmdb.Txn) error) error {
+	b.oplock.RLock()
+	defer b.oplock.RUnlock()
+	for {
+		err := b.env.Update(doUpdate)
+		switch {
+		case err == nil: // shortcircuit happy path.
+			return nil
+		case lmdb.IsMapFull(err) || lmdb.IsMapResized(err):
+			if err = b.growGuarded(); err != nil {
+				return err
+			}
+		case lmdb.IsErrno(err, lmdb.ReadersFull):
+			b.oplock.RUnlock() // yield.
+			b.sleep("updateImpl")
+			b.oplock.RLock()
+		default:
+			return err
+		}
+	}
+}
+
+// Has checks if the cid is present in the blockstore
 func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-Retry:
-	err := b.env.View(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
-		_, err := txn.Get(b.db, cid.Hash())
-		return err
-	})
-	switch {
-	case err == nil:
-		return true, nil
-	case lmdb.IsNotFound(err):
+	err := b.getImpl(cid, func(val []byte) error { return nil })
+	if lmdb.IsNotFound(err) {
 		return false, nil
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("has")
-		b.oplock.RLock()
-		goto Retry
-
 	}
-	return false, err
+	return err == nil, err
 }
 
-func (b *Blockstore) Get(cid cid.Cid) (blocks.Block, error) {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-	var val []byte
-
-Retry:
-	err := b.env.View(func(txn *lmdb.Txn) error {
-		v, err := txn.Get(b.db, cid.Hash())
-		if err == nil {
-			val = v
+// Get retrieves a block with the given cid
+// When block is not found, blockstore.ErrNotFound is returned
+// Please note that bytes of the whole block are copied,
+// if you want only to read some of the bytes of the block, use View
+func (b *Blockstore) Get(key cid.Cid) (blocks.Block, error) {
+	var res blocks.Block
+	err := b.getImpl(key, func(v []byte) (err error) {
+		if b.rehash.Load() {
+			var key2 cid.Cid
+			key2, err = key.Prefix().Sum(v)
+			if err != nil && !key2.Equals(key) {
+				err = blockstore.ErrHashMismatch
+			}
 		}
-		return err
+		if err != nil {
+			return
+		}
+		val := make([]byte, len(v))
+		copy(val, v)
+		res, err = blocks.NewBlockWithCid(val, key)
+		return
 	})
 
-	switch {
-	case err == nil:
-		return blocks.NewBlockWithCid(val, cid)
-	case lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize):
+	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
 		// lmdb returns badvalsize with nil keys.
-		err = blockstore.ErrNotFound
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("get")
-		b.oplock.RLock()
-		goto Retry
+		return nil, blockstore.ErrNotFound
 	}
-	return nil, err
+	return res, err
 }
 
+// View retrieves bytes of a block with the given cid and
+// calls the callback on it.
+// When block is not found, blockstore.ErrNotFound is returned
+// Note that it is not safe to access bytes passed to the callback
+// outside of the callback's call context.
 func (b *Blockstore) View(cid cid.Cid, callback func([]byte) error) error {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-Retry:
-	err := b.env.View(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
-		v, err := txn.Get(b.db, cid.Hash())
-		if err == nil {
-			return callback(v)
-		}
-		return err
-	})
-	switch {
-	case err == nil: // shortcircuit the happy path with no comparisons.
-	case lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize):
+	err := b.getImpl(cid, callback)
+	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
 		// lmdb returns badvalsize with nil keys.
-		err = blockstore.ErrNotFound
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("view")
-		b.oplock.RLock()
-		goto Retry
+		return blockstore.ErrNotFound
 	}
 	return err
 }
 
+// GetSize returns size of the block.
+// When block is not found, blockstore.ErrNotFound is returned
 func (b *Blockstore) GetSize(cid cid.Cid) (int, error) {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-Retry:
 	size := -1
-	err := b.env.View(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
-		v, err := txn.Get(b.db, cid.Hash())
-		if err == nil {
-			size = len(v)
-		}
-		return err
+	err := b.getImpl(cid, func(v []byte) error {
+		size = len(v)
+		return nil
 	})
-
-	switch {
-	case err == nil: // shortcircuit happy path.
-	case lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize):
+	if lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize) {
+		// lmdb returns badvalsize with nil keys.
 		err = blockstore.ErrNotFound
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("get size")
-		b.oplock.RLock()
-		goto Retry
 	}
-
 	return size, err
 }
 
+// Put adds the block to the blockstore
+// This is a no-op when block is already present in the Blockstore,
+// no overwrite will take place.
 func (b *Blockstore) Put(block blocks.Block) error {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-Retry:
-	err := b.env.Update(func(txn *lmdb.Txn) error {
-		return txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
-	})
-
-	switch {
-	case err == nil || lmdb.IsErrno(err, lmdb.KeyExist): // shortcircuit happy path.
-		return nil
-	case lmdb.IsMapFull(err):
-		o := b.dedupGrow   // take the deduplicator under the lock.
-		b.oplock.RUnlock() // drop the concurrent lock.
-		var err error
-		o.Do(func() { err = b.grow() })
-		if err != nil {
-			return fmt.Errorf("lmdb put failed: %w", err)
+	return b.updateImpl(func(txn *lmdb.Txn) error {
+		err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
+		if err == nil || lmdb.IsErrno(err, lmdb.KeyExist) {
+			return nil
 		}
-		b.oplock.RLock() // reclaim the concurrent lock.
-		goto Retry
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("put")
-		b.oplock.RLock()
-		goto Retry
-	}
-
-	return err
+		return err
+	})
 }
 
+// PutMany adds the blocks to the blockstore
+// This is a no-op for blocks that are already present in the Blockstore,
+// no overwrites will take place.
 func (b *Blockstore) PutMany(blocks []blocks.Block) error {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-Retry:
-	err := b.env.Update(func(txn *lmdb.Txn) error {
+	return b.updateImpl(func(txn *lmdb.Txn) error {
 		for _, block := range blocks {
 			err := txn.Put(b.db, block.Cid().Hash(), block.RawData(), lmdb.NoOverwrite)
 			if err != nil && !lmdb.IsErrno(err, lmdb.KeyExist) {
@@ -451,200 +420,124 @@ Retry:
 		}
 		return nil
 	})
-
-	switch {
-	case err == nil: // shortcircuit happy path.
-	case lmdb.IsMapFull(err):
-		o := b.dedupGrow   // take the deduplicator under the lock.
-		b.oplock.RUnlock() // drop the concurrent lock.
-		var err error
-		o.Do(func() { err = b.grow() })
-		if err != nil {
-			return fmt.Errorf("lmdb put many failed: %w", err)
-		}
-		b.oplock.RLock() // reclaim the concurrent lock.
-		goto Retry
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("put many")
-		b.oplock.RLock()
-		goto Retry
-	}
-
-	return err
 }
 
+// DeleteBlock removes the block from the blockstore, given its cid.
+// This is a no-op for cid that is absent in the Blockstore.
 func (b *Blockstore) DeleteBlock(cid cid.Cid) error {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-Retry:
-	err := b.env.Update(func(txn *lmdb.Txn) error {
-		return txn.Del(b.db, cid.Hash(), nil)
-	})
-	switch {
-	case err == nil || lmdb.IsNotFound(err): // shortcircuit happy path.
-		return nil
-	case lmdb.IsMapFull(err):
-		o := b.dedupGrow   // take the deduplicator under the lock.
-		b.oplock.RUnlock() // drop the concurrent lock.
-		var err error
-		o.Do(func() { err = b.grow() })
-		if err != nil {
-			return fmt.Errorf("lmdb delete failed: %w", err)
+	return b.updateImpl(func(txn *lmdb.Txn) error {
+		err := txn.Del(b.db, cid.Hash(), nil)
+		if err == nil || lmdb.IsNotFound(err) {
+			return nil
 		}
-		b.oplock.RLock() // reclaim the concurrent lock.
-		goto Retry
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("delete")
-		b.oplock.RLock()
-		goto Retry
-	}
-	return err
+		return err
+	})
 }
 
+// DeleteMany removes blocks from the blockstore with the given cids.
+// This is a no-op for cids that are absent in the Blockstore.
 func (b *Blockstore) DeleteMany(cids []cid.Cid) error {
-	b.oplock.RLock()
-	defer b.oplock.RUnlock()
-
-Retry:
-	err := b.env.Update(func(txn *lmdb.Txn) error {
+	return b.updateImpl(func(txn *lmdb.Txn) error {
 		for _, c := range cids {
-			if err := txn.Del(b.db, c.Hash(), nil); err != nil {
+			err := txn.Del(b.db, c.Hash(), nil)
+			if err != nil && !lmdb.IsNotFound(err) {
 				return err
 			}
 		}
 		return nil
 	})
-	switch {
-	case err == nil || lmdb.IsNotFound(err): // shortcircuit happy path.
-		return nil
-	case lmdb.IsMapFull(err):
-		o := b.dedupGrow   // take the deduplicator under the lock.
-		b.oplock.RUnlock() // drop the concurrent lock.
-		var err error
-		o.Do(func() { err = b.grow() })
-		if err != nil {
-			return fmt.Errorf("lmdb delete failed: %w", err)
-		}
-		b.oplock.RLock() // reclaim the concurrent lock.
-		goto Retry
-	case lmdb.IsErrno(err, lmdb.ReadersFull):
-		b.oplock.RUnlock() // yield.
-		b.sleep("delete many")
-		b.oplock.RLock()
-		goto Retry
-	}
-	return err
-
 }
 
 type cursor struct {
+	// Context to finish iteration when it is finished
 	ctx context.Context
-	b   *Blockstore
+	// blockstore which we should update when iteration is finished
+	blockstore *Blockstore
 
-	last        cid.Cid
-	outCh       chan cid.Cid
-	interruptCh chan chan struct{}
+	// Resulting channel with all the keys
+	out chan cid.Cid
 
-	runlk  sync.Mutex
-	doneCh chan struct{}
-}
+	// last cid that was sent on the `out`
+	// used to restart iteration properly after
+	// interruption followed by grow() operation
+	last cid.Cid
 
-var errInterrupted = errors.New("interrupted")
-
-// interrupt interrupts a cursor, and waits until the cursor is interrupted.
-func (c *cursor) interrupt() {
-	ch := make(chan struct{})
-	select {
-	case c.interruptCh <- ch:
-		<-ch
-	case <-c.doneCh:
-		// this cursor is already done and is no longer listening for
-		// interrupt signals.
-	}
+	// structure to interrupt the cursor
+	interrupt interruptChan
 }
 
 // run runs this cursor
 func (c *cursor) run() {
-	c.runlk.Lock()
-	defer c.runlk.Unlock()
-
-	select {
-	case <-c.doneCh:
-		return // already done.
-	default:
-	}
-
-Retry:
-	var notifyClosed chan struct{}
-	err := c.b.env.View(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
-		cur, err := txn.OpenCursor(c.b.db)
-		if err != nil {
-			return err
-		}
-		defer cur.Close()
-
-		if c.last.Defined() {
-			_, _, err := cur.Get(c.last.Hash(), nil, lmdb.Set)
-			if err != nil {
-				return fmt.Errorf("failed to position cursor: %w", err)
-			}
-		}
-
-		for c.ctx.Err() == nil { // context has fired.
-			// yield if an interrupt has been requested.
-			select {
-			case notifyClosed = <-c.interruptCh:
-				return errInterrupted
-			default:
-			}
-
-			k, _, err := cur.Get(nil, nil, lmdb.Next)
-			if lmdb.IsNotFound(err) {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-
-			it := cid.NewCidV1(cid.Raw, k) // makes a copy of k
-			select {
-			case c.outCh <- it:
-			case notifyClosed = <-c.interruptCh:
-				return errInterrupted
-			case <-c.ctx.Done():
-				return nil
-			}
-			c.last = it
-		}
-		return nil
-	})
-
-	if lmdb.IsErrno(err, lmdb.ReadersFull) {
-		log.Warnf("cursor encountered MDB_READERS_FULL; waiting %s", c.b.retryDelay)
-		time.Sleep(c.b.retryDelay)
-		goto Retry
-	}
-
-	if err == errInterrupted {
-		close(notifyClosed)
+	if c.interrupt.IsClosed() {
 		return
 	}
 
-	// this cursor is finished, either in success or in error.
-	close(c.doneCh)
-	close(c.outCh)
-	c.b.cursorlock.Lock()
-	for i, other := range c.b.cursors {
-		if other == c {
-			c.b.cursors = append(c.b.cursors[:i], c.b.cursors[i+1:]...)
-			break
+	for {
+		var notifyClosed chan struct{}
+		err := c.blockstore.env.View(func(txn *lmdb.Txn) error {
+			txn.RawRead = true
+			cur, err := txn.OpenCursor(c.blockstore.db)
+			if err != nil {
+				return err
+			}
+			defer cur.Close()
+
+			if c.last.Defined() {
+				_, _, err := cur.Get(c.last.Hash(), nil, lmdb.Set)
+				if err != nil {
+					return fmt.Errorf("failed to position cursor: %w", err)
+				}
+			}
+
+			for c.ctx.Err() == nil { // context is not done
+				// yield if an interrupt has been requested.
+				notifyClosed = c.interrupt.IsInterrupted()
+				if notifyClosed != nil {
+					return nil
+				}
+
+				k, _, err := cur.Get(nil, nil, lmdb.Next)
+				if lmdb.IsNotFound(err) {
+					return nil
+				} else if err != nil {
+					return err
+				}
+
+				it := cid.NewCidV1(cid.Raw, k) // makes a copy of k
+				select {
+				case c.out <- it:
+				case notifyClosed = <-c.interrupt.InterruptChan():
+					// return nil if there was an interrupt
+					return nil
+				case <-c.ctx.Done():
+					return nil
+				}
+				c.last = it
+			}
+			return nil
+		})
+
+		if lmdb.IsErrno(err, lmdb.ReadersFull) {
+			log.Warnf("cursor encountered MDB_READERS_FULL; waiting %s", c.blockstore.retryDelay)
+			time.Sleep(c.blockstore.retryDelay)
+		} else if notifyClosed != nil {
+			close(notifyClosed)
+			return
+		} else {
+			// this cursor is finished, either in success or in error.
+			c.interrupt.Close()
+			close(c.out)
+			c.blockstore.cursorlock.Lock()
+			defer c.blockstore.cursorlock.Unlock()
+			for i, other := range c.blockstore.cursors {
+				if other == c {
+					c.blockstore.cursors = append(c.blockstore.cursors[:i], c.blockstore.cursors[i+1:]...)
+					break
+				}
+			}
+			return
 		}
 	}
-	c.b.cursorlock.Unlock()
 }
 
 // AllKeysChan starts a cursor to return all keys from the underlying
@@ -655,6 +548,9 @@ Retry:
 // Consistency is not guaranteed. That is, keys returned are not a snapshot
 // taken when this method is called. The set of returned keys will vary with
 // concurrent writes.
+//
+// All errors happening while iterating (except for concurrent reader limit hit)
+// are ignored, hence this method is to be avoided whenever possible.
 func (b *Blockstore) AllKeysChan(ctx context.Context) (<-chan cid.Cid, error) {
 	ch := make(chan cid.Cid)
 
@@ -662,11 +558,10 @@ func (b *Blockstore) AllKeysChan(ctx context.Context) (<-chan cid.Cid, error) {
 	defer b.cursorlock.Unlock()
 
 	c := &cursor{
-		ctx:         ctx,
-		b:           b,
-		outCh:       ch,
-		interruptCh: make(chan chan struct{}),
-		doneCh:      make(chan struct{}),
+		ctx:        ctx,
+		blockstore: b,
+		out:        ch,
+		interrupt:  makeInterruptChan(),
 	}
 
 	b.cursors = append(b.cursors, c)
@@ -676,14 +571,15 @@ func (b *Blockstore) AllKeysChan(ctx context.Context) (<-chan cid.Cid, error) {
 	return ch, nil
 }
 
-func (b *Blockstore) HashOnRead(_ bool) {
-	// not supported
-}
-
 func (b *Blockstore) grow() error {
-	b.oplock.Lock() // acquire the exclusive lock.
+	// acquire the exclusive lock so that no new update
+	// or read operation will start while grow() runs
+	// (already running operations will finish first)
+	b.oplock.Lock()
 	defer b.oplock.Unlock()
 
+	// acquire cursor lock so that no cursors will
+	// be created or finished while grow() runs
 	b.cursorlock.Lock()
 	defer b.cursorlock.Unlock()
 
@@ -691,7 +587,8 @@ func (b *Blockstore) grow() error {
 
 	// interrupt all cursors.
 	for _, c := range b.cursors {
-		c.interrupt() // will wait until the transaction finishes.
+		// will wait until cursor's run() finishes
+		c.interrupt.Interrupt()
 	}
 
 	prev, err := b.env.Info()
@@ -703,10 +600,10 @@ func (b *Blockstore) grow() error {
 	// of pagesize. If the proposed growth is larger than the maximum allowable
 	// step, reset to the current size + max step.
 	nextSize := int64(math.Ceil(float64(prev.MapSize) * b.opts.MmapGrowthStepFactor))
-	nextSize = roundup(nextSize, b.pagesize) // round to a pagesize multiple.
 	if nextSize > prev.MapSize+b.opts.MmapGrowthStepMax {
 		nextSize = prev.MapSize + b.opts.MmapGrowthStepMax
 	}
+	nextSize = roundup(nextSize, b.pagesize) // round to a pagesize multiple.
 	if err := b.env.SetMapSize(nextSize); err != nil {
 		return fmt.Errorf("failed to grow the mmap: %w", err)
 	}
@@ -739,6 +636,7 @@ func roundup(value, multiple int64) int64 {
 	return int64(math.Ceil(float64(value)/float64(multiple))) * multiple
 }
 
+// Stat returns lmdb statistics
 func (b *Blockstore) Stat() (*lmdb.Stat, error) {
 	return b.env.Stat()
 }
