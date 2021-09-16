@@ -123,6 +123,12 @@ type Options struct {
 	// backpressure, instead of a straight out error.
 	// Jittered by RetryJitter (default: +/-20%).
 	RetryDelay time.Duration
+
+	// NoLock: Don't do any locking. If concurrent access is anticipated, the caller must manage all concurrency
+	//   itself. For proper operation the caller must enforce single-writer semantics, and must ensure that no readers
+	//   are using old transactions while a writer is active. The simplest approach is to use an exclusive lock so that
+	//   no readers may be active at all when a writer begins.
+	NoLock bool
 }
 
 func Open(opts *Options) (*Blockstore, error) {
@@ -256,6 +262,9 @@ func Open(opts *Options) (*Blockstore, error) {
 	// https://twitter.com/yrashk/status/838621043480748036
 	// https://github.com/PumpkinDB/PumpkinDB/pull/178
 	var flags uint = lmdb.NoReadahead | lmdb.WriteMap
+	if opts.NoLock {
+		flags |= lmdb.NoLock
+	}
 	if opts.ReadOnly {
 		flags |= lmdb.Readonly
 	}
@@ -275,7 +284,7 @@ func Open(opts *Options) (*Blockstore, error) {
 		retryDelay:       opts.RetryDelay,
 		retryJitterBound: time.Duration(float64(opts.RetryDelay) * RetryJitter),
 	}
-	err = env.Update(func(txn *lmdb.Txn) (err error) {
+	err = env.View(func(txn *lmdb.Txn) (err error) {
 		bs.db, err = txn.OpenRoot(lmdb.Create)
 		return err
 	})

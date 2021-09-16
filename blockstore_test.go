@@ -1,6 +1,7 @@
 package lmdbbs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
+	ipfsUtil "github.com/ipfs/go-ipfs-util"
 	logger "github.com/ipfs/go-log/v2"
 	"github.com/multiformats/go-multihash"
 	bstest "github.com/raulk/go-bs-tests"
@@ -70,6 +72,54 @@ func openBlockstore(opts Options) func(tb testing.TB, path string) (bstest.Block
 	}
 }
 
+func checkBlocksBs(t *testing.T, bs blockstore.Viewer, blocks []blocks.Block) {
+	for _, b := range blocks {
+		require.NoError(t, bs.View(b.Cid(), func(data []byte) error {
+			if !bytes.Equal(data, b.RawData()) {
+				return fmt.Errorf("unexpected value for a key")
+			}
+			return nil
+		}))
+	}
+}
+
+func TestMmapExpansionAndParallelContext(t *testing.T) {
+	opts := Options{InitialMmapSize: 1 << 20, NoLock: true} // 1MiB.
+
+	bs, path := newBlockstore(opts)(t)
+
+	info, err := bs.(*Blockstore).env.Info()
+	require.NoError(t, err)
+	prev := info.MapSize
+
+	blocks1 := putEntries(t, bs, 16*1024, 1*1024)
+
+	info, err = bs.(*Blockstore).env.Info()
+	require.NoError(t, err)
+	current := info.MapSize
+	require.Greater(t, current, prev)
+
+	opts.ReadOnly = true
+	// reopen the database with the original initial mmap size.
+	bs2, err := openBlockstore(opts)(t, path)
+	require.NoError(t, err)
+
+	info, err = bs2.(*Blockstore).env.Info()
+	require.NoError(t, err)
+	reopened := info.MapSize
+	require.Greater(t, int(reopened), 1<<23)
+
+	checkBlocksBs(t, bs2, blocks1)
+
+	// verify that we can add more entries, and that we grow again.
+	blocks2 := putEntries(t, bs, 16*1024, 1*1024)
+	info, err = bs.(*Blockstore).env.Info()
+	require.NoError(t, err)
+	final := info.MapSize
+	require.Greater(t, final, reopened)
+
+	checkBlocksBs(t, bs2, blocks2)
+}
 func TestMmapExpansionSucceedsReopen(t *testing.T) {
 	opts := Options{InitialMmapSize: 1 << 20} // 1MiB.
 
@@ -79,7 +129,7 @@ func TestMmapExpansionSucceedsReopen(t *testing.T) {
 	require.NoError(t, err)
 	prev := info.MapSize
 
-	putEntries(t, bs, 16*1024, 1*1024)
+	blocks1 := putEntries(t, bs, 16*1024, 1*1024)
 
 	info, err = bs.(*Blockstore).env.Info()
 	require.NoError(t, err)
@@ -96,7 +146,9 @@ func TestMmapExpansionSucceedsReopen(t *testing.T) {
 	info, err = bs.(*Blockstore).env.Info()
 	require.NoError(t, err)
 	reopened := info.MapSize
-	require.EqualValues(t, 34168832, reopened) // this is the exact database size.
+	require.Greater(t, int(reopened), 1<<23)
+
+	checkBlocksBs(t, bs, blocks1)
 
 	// verify that we can add more entries, and that we grow again.
 	putEntries(t, bs, 16*1024, 1*1024)
@@ -232,7 +284,7 @@ func TestRetryWhenReadersFull(t *testing.T) {
 	bs, _ := newBlockstore(opts)(t)
 	defer bs.(io.Closer).Close()
 
-	putEntries(t, bs, 1*1024, 1*1024)
+	blocks := putEntries(t, bs, 1*1024, 1*1024)
 
 	// this context cancels in 2 seconds.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -240,7 +292,12 @@ func TestRetryWhenReadersFull(t *testing.T) {
 
 	ch, err := bs.AllKeysChan(ctx)
 	require.NoError(t, err)
-	<-ch // consume one element, then leave it hanging.
+	k1 := <-ch // consume one element, then leave it hanging.
+	keyExists := false
+	for _, block := range blocks {
+		keyExists = keyExists || k1.Equals(block.Cid())
+	}
+	require.True(t, keyExists, "Key received from the channel is unknown")
 
 	// this get will block until the cursor has finished.
 	start := time.Now()
@@ -265,7 +322,9 @@ func TestMmapExpansionPutMany(t *testing.T) {
 	for i := 0; i < 1024; i++ {
 		b := make([]byte, 1024)
 		rand.Read(b)
-		blk := blocks.NewBlock(b)
+		c := cid.NewCidV1(cid.Raw, ipfsUtil.Hash(b)) // makes a copy of k
+		blk, err := blocks.NewBlockWithCid(b, c)
+		require.NoError(t, err)
 		blks = append(blks, blk)
 	}
 
@@ -273,17 +332,18 @@ func TestMmapExpansionPutMany(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func putEntries(t *testing.T, bs bstest.Blockstore, count int, size int) {
+func putEntries(t *testing.T, bs bstest.Blockstore, count int, size int) []blocks.Block {
+	res := make([]blocks.Block, 0, count)
 	for i := 0; i < count; i++ {
 		b := make([]byte, size)
 		rand.Read(b)
-		blk := blocks.NewBlock(b)
-		err := bs.Put(blk)
-		if err != nil {
-			fmt.Println(err)
-		}
+		c := cid.NewCidV1(cid.Raw, ipfsUtil.Hash(b)) // makes a copy of k
+		blk, err := blocks.NewBlockWithCid(b, c)
 		require.NoError(t, err)
+		require.NoError(t, bs.Put(blk))
+		res = append(res, blk)
 	}
+	return res
 }
 
 func randomCID() cid.Cid {
@@ -307,20 +367,14 @@ func TestDeleteMany(t *testing.T) {
 	bs, _ := newBlockstore(opts)(t)
 	defer bs.(io.Closer).Close()
 
-	var cids []cid.Cid
-	b := make([]byte, 1024)
-	for i := 0; i < 500; i++ {
-		rand.Read(b)
-		blk := blocks.NewBlock(b)
-		err := bs.Put(blk)
-		if err != nil {
-			fmt.Println(err)
-		}
-		require.NoError(t, err)
-		cids = append(cids, blk.Cid())
+	blocks := putEntries(t, bs, 500, 1024)
+	todelete := make([]cid.Cid, 100)
+	for i := range todelete {
+		todelete[i] = blocks[i].Cid()
 	}
 
-	todelete := cids[:100]
+	require.NoError(t, bs.DeleteBlock(todelete[5]))
+	require.NoError(t, bs.DeleteBlock(todelete[5]))
 
 	dm := bs.(deleteManyer)
 
