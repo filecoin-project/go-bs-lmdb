@@ -4,10 +4,9 @@ go 1.15
 
 require (
 	github.com/google/uuid v1.1.2 // indirect
-	github.com/ipfs/go-block-format v0.0.2
+	github.com/ipfs/go-block-format v0.0.3
 	github.com/ipfs/go-cid v0.0.7
-	github.com/ipfs/go-datastore v0.4.5 // indirect
-	github.com/ipfs/go-ipfs-blockstore v1.0.3
+	github.com/ipfs/go-ipfs-blockstore v1.1.2
 	github.com/ipfs/go-log v1.0.4 // indirect
 	github.com/ipfs/go-log/v2 v2.1.2-0.20200626104915-0016c0b4b3e4
 	github.com/ledgerwatch/lmdb-go v1.18.2
@@ -27,3 +26,5 @@ require (
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	gopkg.in/yaml.v2 v2.3.0 // indirect
 )
+
+replace github.com/raulk/go-bs-tests => github.com/whyrusleeping/go-bs-tests v0.1.0

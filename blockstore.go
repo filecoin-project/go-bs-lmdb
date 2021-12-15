@@ -294,7 +294,7 @@ func (b *Blockstore) Close() error {
 	return b.env.Close()
 }
 
-func (b *Blockstore) Has(cid cid.Cid) (bool, error) {
+func (b *Blockstore) Has(ctx context.Context, cid cid.Cid) (bool, error) {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
@@ -319,7 +319,7 @@ Retry:
 	return false, err
 }
 
-func (b *Blockstore) Get(cid cid.Cid) (blocks.Block, error) {
+func (b *Blockstore) Get(ctx context.Context, cid cid.Cid) (blocks.Block, error) {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
@@ -349,7 +349,7 @@ Retry:
 	return nil, err
 }
 
-func (b *Blockstore) View(cid cid.Cid, callback func([]byte) error) error {
+func (b *Blockstore) View(ctx context.Context, cid cid.Cid, callback func([]byte) error) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
@@ -376,7 +376,7 @@ Retry:
 	return err
 }
 
-func (b *Blockstore) GetSize(cid cid.Cid) (int, error) {
+func (b *Blockstore) GetSize(ctx context.Context, cid cid.Cid) (int, error) {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
@@ -405,7 +405,7 @@ Retry:
 	return size, err
 }
 
-func (b *Blockstore) Put(block blocks.Block) error {
+func (b *Blockstore) Put(ctx context.Context, block blocks.Block) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
@@ -437,7 +437,7 @@ Retry:
 	return err
 }
 
-func (b *Blockstore) PutMany(blocks []blocks.Block) error {
+func (b *Blockstore) PutMany(ctx context.Context, blocks []blocks.Block) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
@@ -474,7 +474,7 @@ Retry:
 	return err
 }
 
-func (b *Blockstore) DeleteBlock(cid cid.Cid) error {
+func (b *Blockstore) DeleteBlock(ctx context.Context, cid cid.Cid) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 
@@ -504,7 +504,7 @@ Retry:
 	return err
 }
 
-func (b *Blockstore) DeleteMany(cids []cid.Cid) error {
+func (b *Blockstore) DeleteMany(ctx context.Context, cids []cid.Cid) error {
 	b.oplock.RLock()
 	defer b.oplock.RUnlock()
 

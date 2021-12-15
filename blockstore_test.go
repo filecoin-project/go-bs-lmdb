@@ -71,6 +71,7 @@ func openBlockstore(opts Options) func(tb testing.TB, path string) (bstest.Block
 }
 
 func TestMmapExpansionSucceedsReopen(t *testing.T) {
+	ctx := context.TODO()
 	opts := Options{InitialMmapSize: 1 << 20} // 1MiB.
 
 	bs, path := newBlockstore(opts)(t)
@@ -79,7 +80,7 @@ func TestMmapExpansionSucceedsReopen(t *testing.T) {
 	require.NoError(t, err)
 	prev := info.MapSize
 
-	putEntries(t, bs, 16*1024, 1*1024)
+	putEntries(t, ctx, bs, 16*1024, 1*1024)
 
 	info, err = bs.(*Blockstore).env.Info()
 	require.NoError(t, err)
@@ -99,7 +100,7 @@ func TestMmapExpansionSucceedsReopen(t *testing.T) {
 	require.EqualValues(t, 34168832, reopened) // this is the exact database size.
 
 	// verify that we can add more entries, and that we grow again.
-	putEntries(t, bs, 16*1024, 1*1024)
+	putEntries(t, ctx, bs, 16*1024, 1*1024)
 	info, err = bs.(*Blockstore).env.Info()
 	require.NoError(t, err)
 	final := info.MapSize
@@ -107,6 +108,7 @@ func TestMmapExpansionSucceedsReopen(t *testing.T) {
 }
 
 func TestNoMmapExpansion(t *testing.T) {
+	ctx := context.TODO()
 	opts := Options{InitialMmapSize: 64 << 20} // 64MiB, a large enough mmap size.
 
 	bs, _ := newBlockstore(opts)(t)
@@ -116,7 +118,7 @@ func TestNoMmapExpansion(t *testing.T) {
 	require.NoError(t, err)
 	prev := info.MapSize
 
-	putEntries(t, bs, 16*1024, 1*1024)
+	putEntries(t, ctx, bs, 16*1024, 1*1024)
 
 	info, err = bs.(*Blockstore).env.Info()
 	require.NoError(t, err)
@@ -125,12 +127,13 @@ func TestNoMmapExpansion(t *testing.T) {
 }
 
 func TestMmapExpansionWithCursors(t *testing.T) {
+	ctx := context.TODO()
 	opts := Options{InitialMmapSize: 64 << 20} // 64MiB, a large enough mmap size.
 
 	bs, _ := newBlockstore(opts)(t)
 	defer bs.(io.Closer).Close()
 
-	putEntries(t, bs, 1*1024, 1*1024)
+	putEntries(t, ctx, bs, 1*1024, 1*1024)
 
 	// cursor 1.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -149,7 +152,7 @@ func TestMmapExpansionWithCursors(t *testing.T) {
 	<-ch3 // consume one entry
 
 	// add more entries to force the mmap to grow.
-	putEntries(t, bs, 4*1024, 1*1024)
+	putEntries(t, ctx, bs, 4*1024, 1*1024)
 
 	var i int
 	for range ch1 {
@@ -173,6 +176,7 @@ func TestMmapExpansionWithCursors(t *testing.T) {
 }
 
 func TestGrowUnderConcurrency(t *testing.T) {
+	ctx := context.TODO()
 	opts := Options{ // set a really aggressive policy that makes the mmap grow very frequently.
 		InitialMmapSize:      1 << 10,
 		MmapGrowthStepFactor: 1.5,
@@ -187,7 +191,7 @@ func TestGrowUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			putEntries(t, bs, 1*1024, 1*1024)
+			putEntries(t, ctx, bs, 1*1024, 1*1024)
 		}()
 	}
 
@@ -196,7 +200,7 @@ func TestGrowUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 1024; i++ {
-				_, _ = bs.Get(randomCID())
+				_, _ = bs.Get(ctx, randomCID())
 			}
 		}()
 	}
@@ -206,7 +210,7 @@ func TestGrowUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 1024; i++ {
-				_ = bs.DeleteBlock(randomCID())
+				_ = bs.DeleteBlock(ctx, randomCID())
 			}
 		}()
 	}
@@ -225,6 +229,7 @@ func TestGrowUnderConcurrency(t *testing.T) {
 }
 
 func TestRetryWhenReadersFull(t *testing.T) {
+	ctx := context.TODO()
 	opts := Options{
 		MaxReaders: 1, // single reader to induce contention.
 	}
@@ -232,7 +237,7 @@ func TestRetryWhenReadersFull(t *testing.T) {
 	bs, _ := newBlockstore(opts)(t)
 	defer bs.(io.Closer).Close()
 
-	putEntries(t, bs, 1*1024, 1*1024)
+	putEntries(t, ctx, bs, 1*1024, 1*1024)
 
 	// this context cancels in 2 seconds.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -244,7 +249,7 @@ func TestRetryWhenReadersFull(t *testing.T) {
 
 	// this get will block until the cursor has finished.
 	start := time.Now()
-	_, err = bs.Get(randomCID())
+	_, err = bs.Get(ctx, randomCID())
 	require.Equal(t, blockstore.ErrNotFound, err)
 	require.GreaterOrEqual(t, time.Since(start).Nanoseconds(), 1*time.Second.Nanoseconds())
 }
@@ -269,16 +274,16 @@ func TestMmapExpansionPutMany(t *testing.T) {
 		blks = append(blks, blk)
 	}
 
-	err := bs.PutMany(blks)
+	err := bs.PutMany(context.TODO(), blks)
 	require.NoError(t, err)
 }
 
-func putEntries(t *testing.T, bs bstest.Blockstore, count int, size int) {
+func putEntries(t *testing.T, ctx context.Context, bs bstest.Blockstore, count int, size int) {
 	for i := 0; i < count; i++ {
 		b := make([]byte, size)
 		rand.Read(b)
 		blk := blocks.NewBlock(b)
-		err := bs.Put(blk)
+		err := bs.Put(ctx, blk)
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -294,10 +299,11 @@ func randomCID() cid.Cid {
 }
 
 type deleteManyer interface {
-	DeleteMany([]cid.Cid) error
+	DeleteMany(context.Context, []cid.Cid) error
 }
 
 func TestDeleteMany(t *testing.T) {
+	ctx := context.TODO()
 	opts := Options{
 		InitialMmapSize:      1 << 10,
 		MmapGrowthStepFactor: 1.5,
@@ -312,7 +318,7 @@ func TestDeleteMany(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		rand.Read(b)
 		blk := blocks.NewBlock(b)
-		err := bs.Put(blk)
+		err := bs.Put(ctx, blk)
 		if err != nil {
 			fmt.Println(err)
 		}
@@ -324,7 +330,7 @@ func TestDeleteMany(t *testing.T) {
 
 	dm := bs.(deleteManyer)
 
-	if err := dm.DeleteMany(todelete); err != nil {
+	if err := dm.DeleteMany(ctx, todelete); err != nil {
 		t.Fatal(err)
 	}
 
