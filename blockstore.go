@@ -13,6 +13,7 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
+	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ledgerwatch/lmdb-go/lmdb"
 	"github.com/pkg/errors"
@@ -339,7 +340,7 @@ Retry:
 		return blocks.NewBlockWithCid(val, cid)
 	case lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize):
 		// lmdb returns badvalsize with nil keys.
-		err = blockstore.ErrNotFound
+		err = ipld.ErrNotFound{Cid: cid}
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
 		b.sleep("get")
@@ -366,7 +367,7 @@ Retry:
 	case err == nil: // shortcircuit the happy path with no comparisons.
 	case lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize):
 		// lmdb returns badvalsize with nil keys.
-		err = blockstore.ErrNotFound
+		err = ipld.ErrNotFound{Cid: cid}
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
 		b.sleep("view")
@@ -394,7 +395,7 @@ Retry:
 	switch {
 	case err == nil: // shortcircuit happy path.
 	case lmdb.IsNotFound(err) || lmdb.IsErrno(err, lmdb.BadValSize):
-		err = blockstore.ErrNotFound
+		err = ipld.ErrNotFound{Cid: cid}
 	case lmdb.IsErrno(err, lmdb.ReadersFull):
 		b.oplock.RUnlock() // yield.
 		b.sleep("get size")
